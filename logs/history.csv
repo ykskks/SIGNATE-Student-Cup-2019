@@ -1,0 +1,2 @@
+,n_rounds,lr,boosting,bag_freq,bag_frac,seed,metric,min_data_in_leaf,cv_rmse
+BASE_1,10000.0,0.01,gbdt,1.0,0.7,42.0,rmse,50.0,22619.72091263542
