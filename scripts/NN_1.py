@@ -11,10 +11,7 @@ import japanize_matplotlib
 import category_encoders as ce
 from sklearn.model_selection import KFold, StratifiedKFold
 from sklearn.metrics import mean_squared_error
-from sklearn.preprocessing import StandardScaler
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+import lightgbm as lgb
 
 sys.path.append(".")
 from utils import update_tracking, log_evaluation, preprocess_df
@@ -23,9 +20,8 @@ from utils import update_tracking, log_evaluation, preprocess_df
 #################### 
 ## Changes
 #################### 
-# MODEL_ID = "TEINEI_13"
+# MODEL_ID = "TEINEI_17"
 MODEL_ID = "NN_1"
-
 
 
 
@@ -113,11 +109,24 @@ train_processed.loc[20231, "age_in_months"] = 52 * 12 + 5 # 築520年、おそ�
 train_processed.loc[5775, "rent"] = 120350 # 条件からしてありえない高値。おそらくゼロの個数違い
 train_processed.loc[20926, "area"] = 43.01 # 条件からしてありえなく広い。おそらくゼロの個数違い
 
+
+train_processed["ku"] = train_processed["location"].apply(lambda x: re.search("(?<=都).*?区", x).group())
+train_processed["group"] = train_processed["ku"] + train_processed["building_floor"].astype(str) \
+                    + train_processed["age_in_months"].astype(str) + train_processed["area"].astype(str)
+
+rent_dic = train_processed.groupby("group")["rent"].mean()
+
+
+test_processed["ku"] = test_processed["location"].apply(lambda x: re.search("(?<=都).*?区", x).group())
+test_group = test_processed["ku"] + test_processed["building_floor"].astype(str) \
+                    + test_processed["age_in_months"].astype(str) + test_processed["area"].astype(str)
+
 train_processed.reset_index(drop=True, inplace=True)
 target = train_processed["rent"]
 target_log = np.log1p(target)
 train_processed.drop(["id", "rent"], axis=1, inplace=True)
 test_processed.drop("id", axis=1, inplace=True)
+
 
 #################### 
 ## get feature
@@ -175,6 +184,7 @@ def get_long_lati(loc_processed):
     else:
         return np.nan
     
+# 丁目の情報がないのがほとんどnanの原因でいくつかはとってきたcsvにその丁目の情報なし
 train_processed["lati_long"] = train_processed["loc_processed"].apply(get_long_lati)
 test_processed["lati_long"] = test_processed["loc_processed"].apply(get_long_lati)
 train_use["lati"] = train_processed["lati_long"].apply(lambda x: float(x.split(",")[0]) if not pd.isnull(x) else np.nan)
@@ -365,6 +375,19 @@ for fold, (train_idx, val_idx) in enumerate(folds.split(train_use, train_use["di
 # inverse log transformation
 oof = np.expm1(oof)
 predictions = np.expm1(predictions)
+
+
+# post processing
+post_process = pd.DataFrame()
+post_process["pred"] = predictions
+post_process["group"] = test_group
+
+# trainの中に一致するものがあればそれにあわせる
+# trainになかったものに対しても、testの予測値の平均をとる
+pred_dic = post_process.groupby("group")["pred"].mean()
+post_process["pred"] = post_process["group"].apply(lambda x: rent_dic[x] if x in rent_dic else pred_dic[x])
+predictions = post_process["pred"]
+
 
 cv_score = np.sqrt(mean_squared_error(oof, target))
 logger.debug(f"5fold CV score: {cv_score}")
