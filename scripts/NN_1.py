@@ -11,7 +11,10 @@ import japanize_matplotlib
 import category_encoders as ce
 from sklearn.model_selection import KFold, StratifiedKFold
 from sklearn.metrics import mean_squared_error
-import lightgbm as lgb
+from sklearn.preprocessing import StandardScaler
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 sys.path.append(".")
 from utils import update_tracking, log_evaluation, preprocess_df
@@ -136,7 +139,7 @@ train_use = pd.DataFrame()
 test_use = pd.DataFrame()
 
 ### location ###
-ce_ordinal = ce.OrdinalEncoder(cols=["district"], handle_missing="value")
+ce_ordinal = ce.OneHotEncoder(cols=["district"], handle_missing="value")
 train_use["district"] = train_processed["district"]
 test_use["district"] = test_processed["district"]
 train_use = ce_ordinal.fit_transform(train_use)
@@ -219,7 +222,7 @@ test_use[sta_cols] = test_processed[sta_cols]
 
 
 ### layout ###
-ce_ordinal = ce.OrdinalEncoder(cols=["layout"], handle_missing="value")
+ce_ordinal = ce.OneHotEncoder(cols=["layout"], handle_missing="value")
 train_use["layout"] = train_processed["layout"]
 test_use["layout"] = test_processed["layout"]
 train_use = ce_ordinal.fit_transform(train_use)
@@ -238,7 +241,7 @@ train_use[age_cols] = train_processed[age_cols]
 test_use[age_cols] = test_processed[age_cols]
 
 ### direction ###
-ce_ordinal = ce.OrdinalEncoder(cols=["direction"], handle_missing="value")
+ce_ordinal = ce.OneHotEncoder(cols=["direction"], handle_missing="value")
 train_use["direction"] = train_processed["direction"]
 test_use["direction"] = test_processed["direction"]
 train_use = ce_ordinal.fit_transform(train_use)
@@ -320,7 +323,7 @@ test_use[env_cols] = test_processed[env_cols]
 
 
 ### structure ###
-ce_ordinal = ce.OrdinalEncoder(cols=["structure"], handle_missing="value")
+ce_ordinal = ce.OneHotEncoder(cols=["structure"], handle_missing="value")
 train_use["structure"] = train_processed["structure"]
 test_use["structure"] = test_processed["structure"]
 train_use = ce_ordinal.fit_transform(train_use)
@@ -334,25 +337,29 @@ test_use[period_cols] = test_processed[period_cols]
 
 # nan handling
 for col in train_use.columns.values:
-	train_use[col].fillna(-999, inplace=True)
-	test_use[col].fillna(-999, inplace=True)
+	train_use[col].fillna(-1, inplace=True)
+	test_use[col].fillna(-1, inplace=True)
+
+
+# scaling 
+sc = StandardScaler()
+train_use = sc.fit_transform(train_use)
+test_use = sc.transform(test_use)
 
 
 logger.debug(f"Using features:{train_use.columns.values}")
-
-categorical_cols = ["district", "layout", "direction", "structure"]
 
 
 
 #################### 
 ## Train model
 #################### 
-folds = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+folds = KFold(n_splits=5, shuffle=True, random_state=42)
 oof = np.zeros(len(train_use))
 predictions = np.zeros(len(test_use))
 feature_importance_df = pd.DataFrame()
 
-for fold, (train_idx, val_idx) in enumerate(folds.split(train_use, train_use["district"])):
+for fold, (train_idx, val_idx) in enumerate(folds.split(train_use)):
     print(f"Fold {fold+1}")
     train_data = lgb.Dataset(train_use.iloc[train_idx], label=target_log[train_idx], categorical_feature=categorical_cols)
     val_data = lgb.Dataset(train_use.iloc[val_idx], label=target_log[val_idx], categorical_feature=categorical_cols)
