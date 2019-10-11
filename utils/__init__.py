@@ -4,6 +4,8 @@ import re
 import pandas as pd
 import numpy as np
 from lightgbm.callback import _format_eval_result 
+import torch
+from torch.utils.data import Dataset, DataLoader
 
 
 def update_tracking(model_id, field, value, csv_file='logs/history.csv',
@@ -273,3 +275,110 @@ def preprocess_df(df):
 
     
     return df
+
+
+# https://github.com/Bjarten/early-stopping-pytorch/blob/master/pytorchtools.py
+
+class EarlyStopping:
+    """Early stops the training if validation loss doesn't improve after a given patience."""
+    def __init__(self, patience=7, verbose=False, delta=0):
+        """
+        Args:
+            patience (int): How long to wait after last time validation loss improved.
+                            Default: 7
+            verbose (bool): If True, prints a message for each validation loss improvement. 
+                            Default: False
+            delta (float): Minimum change in the monitored quantity to qualify as an improvement.
+                            Default: 0
+        """
+        self.patience = patience
+        self.verbose = verbose
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+        self.val_loss_min = np.Inf
+        self.delta = delta
+
+    def __call__(self, val_loss, model):
+
+        score = -val_loss
+
+        if self.best_score is None:
+            self.best_score = score
+            self.save_checkpoint(val_loss, model)
+        elif score < self.best_score - self.delta:
+            self.counter += 1
+            print(f'EarlyStopping counter: {self.counter} out of {self.patience}')
+            if self.counter >= self.patience:
+                self.early_stop = True
+        else:
+            self.best_score = score
+            self.save_checkpoint(val_loss, model)
+            self.counter = 0
+
+    def save_checkpoint(self, val_loss, model):
+        '''Saves model when validation loss decrease.'''
+        if self.verbose:
+            print(f'Validation loss decreased ({self.val_loss_min:.6f} --> {val_loss:.6f}).  Saving model ...')
+        torch.save(model.state_dict(), 'checkpoint.pt')
+        self.val_loss_min = val_loss
+
+
+# https://yashuseth.blog/2018/07/22/pytorch-neural-network-for-tabular-data-with-categorical-embeddings/
+
+class TabularDataset(Dataset):
+  def __init__(self, data, cat_cols=None, output_col=None):
+    """
+    Characterizes a Dataset for PyTorch
+
+    Parameters
+    ----------
+
+    data: pandas data frame
+      The data frame object for the input data. It must
+      contain all the continuous, categorical and the
+      output columns to be used.
+
+    cat_cols: List of strings
+      The names of the categorical columns in the data.
+      These columns will be passed through the embedding
+      layers in the model. These columns must be
+      label encoded beforehand. 
+
+    output_col: string
+      The name of the output variable column in the data
+      provided.
+    """
+
+    self.n = data.shape[0]
+
+    if output_col:
+      self.y = data[output_col].astype(np.float32).values.reshape(-1, 1)
+    else:
+      self.y =  np.zeros((self.n, 1))
+
+    self.cat_cols = cat_cols if cat_cols else []
+    self.cont_cols = [col for col in data.columns
+                      if col not in self.cat_cols + [output_col]]
+
+    if self.cont_cols:
+      self.cont_X = data[self.cont_cols].astype(np.float32).values
+    else:
+      self.cont_X = np.zeros((self.n, 1))
+
+    if self.cat_cols:
+      self.cat_X = data[cat_cols].astype(np.int64).values
+    else:
+      self.cat_X =  np.zeros((self.n, 1))
+
+  def __len__(self):
+    """
+    Denotes the total number of samples.
+    """
+    return self.n
+
+  def __getitem__(self, idx):
+    """
+    Generates one sample of data.
+    """
+    return [self.y[idx], self.cont_X[idx], self.cat_X[idx]]

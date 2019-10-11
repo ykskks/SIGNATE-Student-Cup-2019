@@ -9,23 +9,24 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import japanize_matplotlib
 import category_encoders as ce
-from sklearn.model_selection import KFold, StratifiedKFold
+from sklearn.model_selection import KFold, StratifiedKFold, train_test_split
 from sklearn.metrics import mean_squared_error
 from sklearn.preprocessing import StandardScaler
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+import torch.optim as optim
 
 sys.path.append(".")
-from utils import update_tracking, log_evaluation, preprocess_df
+from utils import update_tracking, log_evaluation, preprocess_df, TabularDataset, EarlyStopping
 
 
 #################### 
 ## Changes
 #################### 
-# MODEL_ID = "TEINEI_13"
+# MODEL_ID = "TEINEI_17"
 MODEL_ID = "NN_1"
-
 
 
 
@@ -41,45 +42,110 @@ logger.debug(f"./logs/model_logs/{MODEL_ID}.log")
 #################### 
 ## Parameters
 #################### 
-N_ROUNDS = 30000
-LR = 0.01
-BOOSTING = "gbdt"
-BAG_FREQ = 1
-BAG_FRAC = 0.7
-MIN_DATA_IN_LEAF = 50
-SEED = 42
-METRIC = "rmse"
-L1 = 1e-2
-L2 = 1e-2
-MAX_DEPTH = 5
-FEAT_FRAC = 0.9
+NUM_EPOCH = 10000
+BATCH_SIZE = 64
 
-update_tracking(MODEL_ID, "n_rounds", N_ROUNDS)
-update_tracking(MODEL_ID, "lr", LR)
-update_tracking(MODEL_ID, "boosting", BOOSTING)
-update_tracking(MODEL_ID, "bag_freq", BAG_FREQ)
-update_tracking(MODEL_ID, "bag_frac", BAG_FRAC)
-update_tracking(MODEL_ID, "min_data_in_leaf", MIN_DATA_IN_LEAF)
-update_tracking(MODEL_ID, "seed", SEED)
-update_tracking(MODEL_ID, "metric", METRIC)
-update_tracking(MODEL_ID, "lambda_l1", L1)
-update_tracking(MODEL_ID, "lambda_l2", L2)
-update_tracking(MODEL_ID, "max_depth", MAX_DEPTH)
-update_tracking(MODEL_ID, "feature_fraction", FEAT_FRAC)
+update_tracking(MODEL_ID, "num_epoch", NUM_EPOCH)
+update_tracking(MODEL_ID, "batch_size", BATCH_SIZE)
 
 
-params = {"learning_rate": LR,
-         "boosting": BOOSTING,
-         "bagging_freq": BAG_FREQ,
-         "bagging_fraction": BAG_FRAC,
-         "min_data_in_leaf": MIN_DATA_IN_LEAF,
-         "bagging_seed": SEED,
-         "metric": METRIC,
-         "random_state": SEED,
-         "lambda_l1": L1,
-         "lambda_l2": L2,
-         "max_depth": MAX_DEPTH,
-         "feature_fraction": FEAT_FRAC}
+class SigNet(nn.Module):
+
+  def __init__(self, emb_dims, no_of_cont, lin_layer_sizes,
+               output_size, emb_dropout, lin_layer_dropouts):
+
+    """
+    Parameters
+    ----------
+
+    emb_dims: List of two element tuples
+      This list will contain a two element tuple for each
+      categorical feature. The first element of a tuple will
+      denote the number of unique values of the categorical
+      feature. The second element will denote the embedding
+      dimension to be used for that feature.
+
+    no_of_cont: Integer
+      The number of continuous features in the data.
+
+    lin_layer_sizes: List of integers.
+      The size of each linear layer. The length will be equal
+      to the total number
+      of linear layers in the network.
+
+    output_size: Integer
+      The size of the final output.
+
+    emb_dropout: Float
+      The dropout to be used after the embedding layers.
+
+    lin_layer_dropouts: List of floats
+      The dropouts to be used after each linear layer.
+    """
+
+    super().__init__()
+
+    # Embedding layers
+    self.emb_layers = nn.ModuleList([nn.Embedding(x, y)
+                                     for x, y in emb_dims])
+
+    no_of_embs = sum([y for x, y in emb_dims])
+    self.no_of_embs = no_of_embs
+    self.no_of_cont = no_of_cont
+
+    # Linear Layers
+    first_lin_layer = nn.Linear(self.no_of_embs + self.no_of_cont,
+                                lin_layer_sizes[0])
+
+    self.lin_layers =\
+     nn.ModuleList([first_lin_layer] +\
+          [nn.Linear(lin_layer_sizes[i], lin_layer_sizes[i + 1])
+           for i in range(len(lin_layer_sizes) - 1)])
+    
+    for lin_layer in self.lin_layers:
+      nn.init.kaiming_normal_(lin_layer.weight.data)
+
+    # Output Layer
+    self.output_layer = nn.Linear(lin_layer_sizes[-1],
+                                  output_size)
+    nn.init.kaiming_normal_(self.output_layer.weight.data)
+
+    # Batch Norm Layers
+    self.first_bn_layer = nn.BatchNorm1d(self.no_of_cont)
+    self.bn_layers = nn.ModuleList([nn.BatchNorm1d(size)
+                                    for size in lin_layer_sizes])
+
+    # Dropout Layers
+    self.emb_dropout_layer = nn.Dropout(emb_dropout)
+    self.droput_layers = nn.ModuleList([nn.Dropout(size)
+                                  for size in lin_layer_dropouts])
+
+  def forward(self, cont_data, cat_data):
+
+    if self.no_of_embs != 0:
+      x = [emb_layer(cat_data[:, i])
+           for i,emb_layer in enumerate(self.emb_layers)]
+      x = torch.cat(x, 1)
+      x = self.emb_dropout_layer(x)
+
+    if self.no_of_cont != 0:
+      normalized_cont_data = self.first_bn_layer(cont_data)
+
+      if self.no_of_embs != 0:
+        x = torch.cat([x, normalized_cont_data], 1) 
+      else:
+        x = normalized_cont_data
+
+    for lin_layer, dropout_layer, bn_layer in\
+        zip(self.lin_layers, self.droput_layers, self.bn_layers):
+      
+      x = F.relu(lin_layer(x))
+      x = bn_layer(x)
+      x = dropout_layer(x)
+
+    x = self.output_layer(x)
+
+    return x
 
 
 #################### 
@@ -113,11 +179,24 @@ train_processed.loc[20231, "age_in_months"] = 52 * 12 + 5 # 築520年、おそ�
 train_processed.loc[5775, "rent"] = 120350 # 条件からしてありえない高値。おそらくゼロの個数違い
 train_processed.loc[20926, "area"] = 43.01 # 条件からしてありえなく広い。おそらくゼロの個数違い
 
+
+train_processed["ku"] = train_processed["location"].apply(lambda x: re.search("(?<=都).*?区", x).group())
+train_processed["group"] = train_processed["ku"] + train_processed["building_floor"].astype(str) \
+                    + train_processed["age_in_months"].astype(str) + train_processed["area"].astype(str)
+
+rent_dic = train_processed.groupby("group")["rent"].mean()
+
+
+test_processed["ku"] = test_processed["location"].apply(lambda x: re.search("(?<=都).*?区", x).group())
+test_group = test_processed["ku"] + test_processed["building_floor"].astype(str) \
+                    + test_processed["age_in_months"].astype(str) + test_processed["area"].astype(str)
+
 train_processed.reset_index(drop=True, inplace=True)
 target = train_processed["rent"]
 target_log = np.log1p(target)
 train_processed.drop(["id", "rent"], axis=1, inplace=True)
 test_processed.drop("id", axis=1, inplace=True)
+
 
 #################### 
 ## get feature
@@ -175,6 +254,7 @@ def get_long_lati(loc_processed):
     else:
         return np.nan
     
+# 丁目の情報がないのがほとんどnanの原因でいくつかはとってきたcsvにその丁目の情報なし
 train_processed["lati_long"] = train_processed["loc_processed"].apply(get_long_lati)
 test_processed["lati_long"] = test_processed["loc_processed"].apply(get_long_lati)
 train_use["lati"] = train_processed["lati_long"].apply(lambda x: float(x.split(",")[0]) if not pd.isnull(x) else np.nan)
@@ -324,49 +404,160 @@ test_use[period_cols] = test_processed[period_cols]
 
 # nan handling
 for col in train_use.columns.values:
-	train_use[col].fillna(-999, inplace=True)
-	test_use[col].fillna(-999, inplace=True)
+	train_use[col].fillna(-1, inplace=True)
+	test_use[col].fillna(-1, inplace=True)
+
+
+# scaling 
+categorical_cols = ["district", "layout", "direction", "structure"]
+con_cols = [col for col in train_use.columns if col not in categorical_cols]
+
+X_train, X_val, y_train, y_val = train_test_split(train_use, target_log, test_size=0.2, random_state=42)
+
+sc = StandardScaler()
+train_use = pd.concat([X_train[categorical_cols].reset_index(drop=False),\
+                    pd.DataFrame(sc.fit_transform(X_train[con_cols]), columns=con_cols)], axis=1)
+val_use = pd.concat([X_val[categorical_cols].reset_index(drop=False),\
+                    pd.DataFrame(sc.transform(X_val[con_cols]), columns=con_cols)], axis=1)
+test_use = pd.concat([test_use[categorical_cols],\
+                    pd.DataFrame(sc.transform(test_use[con_cols]), columns=con_cols)], axis=1)
 
 
 logger.debug(f"Using features:{train_use.columns.values}")
 
-categorical_cols = ["district", "layout", "direction", "structure"]
 
+
+# perparing dataloader and stuff
+train_use["target_log"] = y_train
+val_use["target_log"] = y_val
+
+train_dataset = TabularDataset(data=train_use, cat_cols=categorical_cols, output_col="target_log")
+val_dataset = TabularDataset(data=val_use, cat_cols=categorical_cols, output_col="target_log")
+test_dataset = TabularDataset(data=test_use, cat_cols=categorical_cols, output_col=None)
+
+train_dataset = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+val_dataset = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=True)
+test_dataset = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+
+cat_dims = [int(train_use[col].nunique()) for col in categorical_cols]
+emb_dims = [(x, min(50, (x + 1) // 2)) for x in cat_dims]
+
+print(cat_dims, emb_dims)
+
+#device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = torch.device("cpu")
+model = SigNet(emb_dims, no_of_cont=len(con_cols), lin_layer_sizes=[50, 100],output_size=1,\
+                emb_dropout=0.04,lin_layer_dropouts=[0.001,0.01]).to(device)
 
 
 #################### 
 ## Train model
 #################### 
-folds = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-oof = np.zeros(len(train_use))
-predictions = np.zeros(len(test_use))
-feature_importance_df = pd.DataFrame()
+criterion = nn.MSELoss()
+optimizer = optim.SGD(model.parameters(), lr=0.001, momentum=0.9)
+early_stopping = EarlyStopping(patience=10, verbose=True)
 
-for fold, (train_idx, val_idx) in enumerate(folds.split(train_use, train_use["district"])):
-    print(f"Fold {fold+1}")
-    train_data = lgb.Dataset(train_use.iloc[train_idx], label=target_log[train_idx], categorical_feature=categorical_cols)
-    val_data = lgb.Dataset(train_use.iloc[val_idx], label=target_log[val_idx], categorical_feature=categorical_cols)
-    num_round = N_ROUNDS
-    callbacks = [log_evaluation(logger, period=100)]
-    clf = lgb.train(params, train_data, num_round, valid_sets = [train_data, val_data], verbose_eval=False, early_stopping_rounds=100, callbacks=callbacks)
-    oof[val_idx] = clf.predict(train_use.values[val_idx], num_iteration=clf.best_iteration)
+
+for epoch in range(NUM_EPOCH):  # loop over the dataset multiple times
+
+    model.train() 
+    train_loss = 0.0
+    val_loss = 0.0
+    for i, data in enumerate(train_dataset):
+        # get the inputs; data is a list of [inputs, labels]
+        y, cont_x, cat_x = data
+
+        cat_x = cat_x.to(device)
+        cont_x = cont_x.to(device)
+        y  = y.to(device)
+
+        # zero the parameter gradients
+        optimizer.zero_grad()
+
+        # forward + backward + optimize
+        outputs = model(cont_x, cat_x)
+        loss = criterion(preds, y)
+        loss.backward()
+        optimizer.step()
+
+        # print statistics
+        train_loss += loss.item()
+
     
-    fold_importance_df = pd.DataFrame()
-    fold_importance_df["feature"] = train_use.columns.values
-    fold_importance_df["importance"] = clf.feature_importance(importance_type="gain")
-    fold_importance_df["fold"] = fold + 1
-    feature_importance_df = pd.concat([feature_importance_df, fold_importance_df], axis=0)
-    feature_importance_df = feature_importance_df[["feature", "importance"]].groupby("feature").mean().sort_values(by="importance", ascending=False).head(50)
-    logger.debug("##### feature importance #####")
-    logger.debug(feature_importance_df)
+    model.eval() 
+    for data in val_dataset:
+        y, cont_x, cat_x = data
+
+        cat_x = cat_x.to(device)
+        cont_x = cont_x.to(device)
+        y  = y.to(device)
+
+        # forward + backward + optimize
+        outputs = model(cont_x, cat_x)
+        loss = criterion(preds, y)
+
+        val_loss += loss.item()
+
+
+    print(f"epoch {epoch+1}: train_loss:{train_loss}, val_loss:{val_loss}")
+
+    early_stopping(valid_loss, model)
+        
+    if early_stopping.early_stop:
+        print("Early stopping")
+        model.load_state_dict(torch.load('checkpoint.pt'))
+        break
+
+print('Finished Training')
+
+
+model.eval() 
+# val prediction
+val_predictions = np.zeros(len(val_dataset))
+val_target = np.zeros(len(val_dataset))
+for i, data in enumerate(val_dataset):
+    y, cont_x, cat_x = data
+
+    cat_x = cat_x.to(device)
+    cont_x = cont_x.to(device)
+
+    # forward + backward + optimize
+    outputs = model(cont_x, cat_x)
+    val_predictions[i: i+BATCH_SIZE] = outputs
+    val_target[i: i+BATCH_SIZE] = y
+
+val_predictions = np.expm1(val_predictions)  
+val_target = np.expm1(val_target)  
+
+
+# test prediction
+predictions = np.zeros(len(test_dataset))
+for i, data in enumerate(test_dataset):
+    _, cont_x, cat_x = data
+
+    cat_x = cat_x.to(device)
+    cont_x = cont_x.to(device)
+
+    # forward + backward + optimize
+    outputs = model(cont_x, cat_x)
+    preds[i: i+BATCH_SIZE] = outputs
     
-    predictions += clf.predict(test_use, num_iteration=clf.best_iteration) / folds.n_splits
-    
-# inverse log transformation
-oof = np.expm1(oof)
 predictions = np.expm1(predictions)
 
-cv_score = np.sqrt(mean_squared_error(oof, target))
+
+# post processing
+post_process = pd.DataFrame()
+post_process["pred"] = predictions
+post_process["group"] = test_group
+
+# trainの中に一致するものがあればそれにあわせる
+# trainになかったものに対しても、testの予測値の平均をとる
+pred_dic = post_process.groupby("group")["pred"].mean()
+post_process["pred"] = post_process["group"].apply(lambda x: rent_dic[x] if x in rent_dic else pred_dic[x])
+predictions = post_process["pred"]
+
+
+cv_score = np.sqrt(mean_squared_error(val_predictions, val_predictions))
 logger.debug(f"5fold CV score: {cv_score}")
 update_tracking(MODEL_ID, "cv_rmse", cv_score)
 
